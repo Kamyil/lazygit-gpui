@@ -1,3 +1,37 @@
+# LazyGit GPUI
+
+Experimental macOS desktop frontend for [LazyGit](https://github.com/jesseduffield/lazygit).
+The native window shows the working-tree file list and color-coded unstaged and staged diffs.
+LazyGit still loads your keybindings and handles every key and Git action. The frontend
+reads structured snapshots of named view buffers over a private subprocess pipe;
+it doesn't scrape a terminal screen or implement Git commands for the panels.
+
+## Build and run
+
+Requires Go 1.26+, Rust, Git, and Xcode. From the repository root:
+
+```sh
+go build -o lazygit .
+cargo build --locked --manifest-path desktop/Cargo.toml
+./desktop/target/debug/lazygit-gpui ./lazygit /path/to/worktree
+```
+
+On Apple Silicon, if your `cc` is not Apple's Clang, set
+`CC=/usr/bin/clang` and `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang`
+for the Cargo build. An omitted worktree argument uses your current directory.
+
+Use your LazyGit navigation bindings (`j`/`k` or arrow keys by default).
+Try it on a disposable worktree first: forwarded shortcuts can make real Git
+changes. The worktree is the only native workflow in this milestone; other
+focused panels show their text, not full native controls. Interactive external
+programs, mouse-driven actions, background refresh without a keypress, and
+Herdr integration are not supported. The desktop uses Git's unified diff in
+place of configured terminal diff renderers, without changing your config.
+
+---
+
+## Upstream LazyGit
+
 <div align="center">
 <sup>Special thanks to:</sup>
 <br>

@@ -875,6 +875,12 @@ func NewGui(
 	gui.stateAccessor = &StateAccessor{gui: gui}
 
 	gui.diffRendererConfig = config.NewDiffRendererConfigManager(func() *config.UserConfig { return gui.UserConfig() })
+	if desktopMode() {
+		// The native renderer consumes unified Git diffs, not terminal formatting.
+		raw := &config.UserConfig{}
+		raw.Git.DiffRenderers = []config.DiffRendererConfig{{Type: "rawGit"}}
+		gui.diffRendererConfig = config.NewDiffRendererConfigManager(func() *config.UserConfig { return raw })
+	}
 
 	return gui, nil
 }
@@ -899,11 +905,14 @@ func (gui *Gui) initGocui(headless bool, test integrationTypes.IntegrationTest) 
 		}
 		width, height = test.HeadlessDimensions()
 	}
+	if desktopMode() {
+		width, height = 160, 55
+	}
 
 	g, err := gocui.NewGui(gocui.NewGuiOpts{
 		OutputMode:       gocui.OutputTrue,
 		SupportOverlaps:  OverlappingEdges,
-		PlayRecording:    playRecording,
+		PlayRecording:    playRecording || desktopMode(),
 		Headless:         headless,
 		RuneReplacements: RuneReplacements,
 		Width:            width,
@@ -952,7 +961,8 @@ func viewsBelongToSamePopupPanel(viewName string, otherViewName string) bool {
 
 // Run: setup the gui with keybindings and start the mainloop
 func (gui *Gui) Run(startArgs appTypes.StartArgs) error {
-	g, err := gui.initGocui(Headless(), startArgs.IntegrationTest)
+	desktop := desktopMode()
+	g, err := gui.initGocui(Headless() || desktop, startArgs.IntegrationTest)
 	if err != nil {
 		return err
 	}
@@ -1025,6 +1035,9 @@ func (gui *Gui) Run(startArgs appTypes.StartArgs) error {
 
 	// setting here so we can use it in layout.go
 	gui.integrationTest = startArgs.IntegrationTest
+	if desktop {
+		go gui.serveDesktop(os.Stdin, os.Stdout)
+	}
 
 	err = gui.g.MainLoop()
 	if errors.Is(err, gocui.ErrQuit) {

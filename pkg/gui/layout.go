@@ -311,7 +311,7 @@ func (gui *Gui) onRepoViewReset() error {
 }
 
 func (gui *Gui) onInitialViewsCreation() error {
-	if !gui.c.UserConfig().DisableStartupPopups {
+	if !desktopMode() && !gui.c.UserConfig().DisableStartupPopups {
 		storedPopupVersion := gui.c.ReadAppState().StartupPopupVersion
 		if storedPopupVersion < StartupPopupVersion {
 			gui.showIntroPopupMessage()
