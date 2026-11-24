@@ -105,7 +105,7 @@ func (gui *Gui) resetHelpersAndControllers() {
 		AmendHelper:     helpers.NewAmendHelper(helperCommon, gpgHelper),
 		FixupHelper:     helpers.NewFixupHelper(helperCommon),
 		Commits:         commitsHelper,
-		SuspendResume:   helpers.NewSuspendResumeHelper(helperCommon),
+		SuspendResume:   helpers.NewSuspendResumeHelper(helperCommon, desktopMode()),
 		Snake:           helpers.NewSnakeHelper(helperCommon),
 		Diff:            diffHelper,
 		DiffLine:        diffLineHelper,

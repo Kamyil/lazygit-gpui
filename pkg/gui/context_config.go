@@ -10,7 +10,17 @@ func (gui *Gui) contextTree() *context.ContextTree {
 		IGuiCommon: gui.c.IGuiCommon,
 		Common:     gui.c.Common,
 	}
-	return context.NewContextTree(contextCommon)
+	contextTree := context.NewContextTree(contextCommon)
+	if desktopMode() {
+		// The desktop frontend scrolls lists itself, so it needs all of
+		// their lines, not just those in the headless screen's viewport.
+		for _, c := range contextTree.Flatten() {
+			if list, ok := c.(interface{ RenderAllLines() }); ok {
+				list.RenderAllLines()
+			}
+		}
+	}
+	return contextTree
 }
 
 func (gui *Gui) defaultSideContext() types.Context {

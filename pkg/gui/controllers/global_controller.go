@@ -130,10 +130,8 @@ func (self *GlobalController) GetKeybindings(opts types.KeybindingsOpts) []*type
 			Handler:     self.c.Helpers().SuspendResume.SuspendApp,
 			Description: self.c.Tr.SuspendApp,
 			GetDisabledReason: func() *types.DisabledReason {
-				if !self.c.Helpers().SuspendResume.CanSuspendApp() {
-					return &types.DisabledReason{
-						Text: self.c.Tr.CannotSuspendApp,
-					}
+				if reason := self.c.Helpers().SuspendResume.CannotSuspendAppReason(); reason != "" {
+					return &types.DisabledReason{Text: reason}
 				}
 				return nil
 			},

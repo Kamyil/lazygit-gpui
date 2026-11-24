@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gookit/color"
 	"github.com/jesseduffield/lazycore/pkg/boxlayout"
 	appTypes "github.com/jesseduffield/lazygit/pkg/app/types"
 	"github.com/jesseduffield/lazygit/pkg/commands"
@@ -68,6 +69,10 @@ type Gui struct {
 
 	// this is the state of the GUI for the current repo
 	State *GuiRepoState
+
+	// The connection to the desktop frontend, if lazygit runs for one (see
+	// desktopMode); nil otherwise.
+	desktop *desktopBridge
 
 	diffRendererConfig *config.DiffRendererConfigManager
 
@@ -880,6 +885,11 @@ func NewGui(
 		raw := &config.UserConfig{}
 		raw.Git.DiffRenderers = []config.DiffRendererConfig{{Type: "rawGit"}}
 		gui.diffRendererConfig = config.NewDiffRendererConfigManager(func() *config.UserConfig { return raw })
+		// The frontend draws colors natively, so terminal settings (TERM,
+		// NO_COLOR) don't apply, and there may be no terminal to detect color
+		// support from at all, e.g. when the frontend is started from Finder.
+		color.Enable = true
+		color.ForceOpenColor()
 	}
 
 	return gui, nil
@@ -906,7 +916,7 @@ func (gui *Gui) initGocui(headless bool, test integrationTypes.IntegrationTest) 
 		width, height = test.HeadlessDimensions()
 	}
 	if desktopMode() {
-		width, height = 160, 55
+		width, height = desktopScreenWidth, desktopScreenHeight
 	}
 
 	g, err := gocui.NewGui(gocui.NewGuiOpts{
@@ -1036,7 +1046,7 @@ func (gui *Gui) Run(startArgs appTypes.StartArgs) error {
 	// setting here so we can use it in layout.go
 	gui.integrationTest = startArgs.IntegrationTest
 	if desktop {
-		go gui.serveDesktop(os.Stdin, os.Stdout)
+		gui.startDesktopBridge()
 	}
 
 	err = gui.g.MainLoop()
@@ -1139,6 +1149,11 @@ func (gui *Gui) runSubprocessWithSuspense(subprocess *oscommands.CmdObj) (bool, 
 func (gui *Gui) runSubprocess(cmdObj *oscommands.CmdObj) error {
 	gui.LogCommand(cmdObj.ToString(), true)
 
+	promptToReturn := gui.integrationTest == nil && gui.Config.GetUserConfig().PromptToReturnFromSubprocess
+	if gui.desktop != nil {
+		return gui.desktop.runSubprocessInTerminal(cmdObj, promptToReturn)
+	}
+
 	subprocess := cmdObj.GetCmd()
 	subprocess.Stdout = os.Stdout
 	subprocess.Stderr = os.Stderr
@@ -1152,7 +1167,7 @@ func (gui *Gui) runSubprocess(cmdObj *oscommands.CmdObj) error {
 	subprocess.Stderr = io.Discard
 	subprocess.Stdin = nil
 
-	if gui.integrationTest == nil && (gui.Config.GetUserConfig().PromptToReturnFromSubprocess || err != nil) {
+	if promptToReturn || (gui.integrationTest == nil && err != nil) {
 		fmt.Fprintf(os.Stdout, "\n%s", style.FgGreen.Sprint(gui.Tr.PressEnterToReturn))
 
 		// scan to buffer to prevent run unintentional operations when TUI resumes.

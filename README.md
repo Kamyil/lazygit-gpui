@@ -1,10 +1,11 @@
 # LazyGit GPUI
 
 Experimental macOS desktop frontend for [LazyGit](https://github.com/jesseduffield/lazygit).
-The native window shows the working-tree file list and color-coded unstaged and staged diffs.
-LazyGit still loads your keybindings and handles every key and Git action. The frontend
-reads structured snapshots of named view buffers over a private subprocess pipe;
-it doesn't scrape a terminal screen or implement Git commands for the panels.
+A native [GPUI](https://www.gpui.rs) window shows LazyGit's own panels, diffs, popups and
+status bar. The real LazyGit runs headless as a subprocess. It loads your config and
+keybindings (custom ones included) and handles every key and Git action. The window
+draws LazyGit's view model from structured messages, so there is no terminal emulation,
+no screen scraping and no webview, and the frontend implements no Git commands of its own.
 
 ## Build and run
 
@@ -19,14 +20,110 @@ cargo build --locked --manifest-path desktop/Cargo.toml
 On Apple Silicon, if your `cc` is not Apple's Clang, set
 `CC=/usr/bin/clang` and `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang`
 for the Cargo build. An omitted worktree argument uses your current directory.
+Try it on a disposable worktree first: every shortcut makes real Git changes.
 
-Use your LazyGit navigation bindings (`j`/`k` or arrow keys by default).
-Try it on a disposable worktree first: forwarded shortcuts can make real Git
-changes. The worktree is the only native workflow in this milestone; other
-focused panels show their text, not full native controls. Interactive external
-programs, mouse-driven actions, background refresh without a keypress, and
-Herdr integration are not supported. The desktop uses Git's unified diff in
-place of configured terminal diff renderers, without changing your config.
+Without `LAZYGIT_GPUI=1` (which the frontend sets for its subprocess) `lazygit` is
+the normal terminal UI, unchanged.
+
+## How it works
+
+`lazygit` in desktop mode runs its usual event loop on a headless 200×60 screen.
+Each time it redraws, it writes a JSON frame to stdout with:
+
+- the visible views, each with its title, tabs, footer, focus, cursor, range
+  selection, scroll origin, staging gutter, text-field cursor and search state
+- the styled lines (text, colors, attributes, hyperlinks) of the views whose
+  content changed since the last frame
+- the side windows, main windows and the popup stack, in LazyGit's order
+
+The frontend sends input back on stdin: key labels in LazyGit's keybinding format
+(`<c-r>`, `<a-enter>`, `<pgdown>`), typed text, pastes, clicks on view lines, tab
+clicks, window focus changes, and requests to load more of a long diff. Every view
+and context is handled the same way, so any panel or popup that LazyGit shows also
+appears in the window, without per-panel code in the frontend.
+
+The protocol lives in `pkg/gui/desktop.go` (Go) and `desktop/src/protocol.rs`
+(Rust).
+
+## What works
+
+- **Side panels and tabs:** status, files/worktrees/submodules, local branches/remotes/tags,
+  commits/reflog, stash, and the sub-views that LazyGit swaps in (commit files,
+  sub-commits, remote branches). The focused window is taller, and each side panel
+  shows its jump number, tabs and footer. Clicking a tab switches to it.
+- **Focus and selection:** LazyGit's cursor, range selection (`v`, shift+arrows) and
+  inactive selection, kept in view as they move.
+- **Diffs and staging:** unstaged and staged diffs in the main and secondary panes,
+  with added and removed lines tinted. `<enter>` on a file enters the diff, where
+  line/hunk staging (`a` toggles hunk mode, space stages or unstages, `v` selects a
+  range) works as in the TUI, with the inclusion gutter. Long diffs load
+  incrementally as you scroll.
+- **Prompts:** text prompts, the two-field commit message panel (subject and body,
+  `<tab>` switches fields, Cmd+Enter or your `confirmInEditor` key commits), masked
+  password prompts, and pasting with Cmd+V.
+- **Menus, confirmations and search:** keybinding menus (`?`), option menus,
+  menu filtering as you type, confirmation and error popups, toasts, `/` search
+  and filter with the match count in the status bar.
+- **Mouse:** clicking a line selects it as LazyGit's mouse handler does, which also
+  focuses the panel. Double-click opens the clicked item, shift-click extends the
+  range, and clicking a panel title focuses that panel. Wheel and trackpad scrolling
+  are native.
+- **Background updates:** auto-refresh, the refresh after the window regains focus,
+  async loaders and toasts all redraw without a keypress.
+- **External programs:** custom commands with `output: terminal`, `editInTerminal`
+  editors, interactive Git commands and other subprocesses run in a new terminal
+  window, by default `open -a Terminal`. Set `LAZYGIT_GPUI_TERMINAL` to a different
+  launcher, which is called with the path of an executable script. The window shows
+  a banner while the command runs, LazyGit waits for it and then refreshes. "Stop
+  waiting" in the banner stops LazyGit from waiting (it doesn't kill the command).
+  Commands that don't need a terminal (custom commands without `output: terminal`,
+  `output: popup`, or editors without `editInTerminal`) run exactly as in the TUI.
+- **Keys:** named keys, Ctrl, Option (Alt) and Command (sent as meta, which is what
+  macOS terminals send and what LazyGit's macOS defaults like `<meta+enter>` use).
+  Cmd+V pastes, Cmd+Q quits, and Cmd+W/H/M/\` stay with macOS. Option-typed
+  characters such as `å` are text in text fields and Alt shortcuts elsewhere.
+
+## Not supported yet
+
+- Horizontal scrolling and line wrapping: lines longer than a pane are clipped.
+  LazyGit also lays out its views for 200×60 cells, which decides column
+  truncation and page sizes (`<pgdown>`) regardless of the window size.
+- Scrolling with the wheel is native and doesn't move LazyGit's own scroll
+  position, so a key that depends on it (like `<pgdown>` after scrolling) starts
+  from where LazyGit last was.
+- Text fields: no IME composition (dead keys and input methods) and no
+  click-to-place caret.
+- Search matches aren't highlighted in the text, only the selection and the
+  count in the status bar.
+- Drag selection, right-click and hover are not supported.
+- Suspending (Ctrl+Z) is refused with a message. Herdr integration is not
+  supported.
+- The external terminal has only been tested with a stand-in launcher, not with
+  a real Terminal.app window. Other operating systems have no default launcher
+  and need `LAZYGIT_GPUI_TERMINAL`.
+- The desktop always uses Git's own diff output in place of configured diff
+  pagers (delta and the like), without changing your config, and ignores
+  `NO_COLOR`.
+- Startup popups (the intro and release notes) are skipped.
+
+## Checks
+
+`desktop/e2e/workflows.py` drives a desktop-mode `lazygit` through the protocol
+the way the window does. It runs against a throwaway repository and config under
+the system temp directory, isolated from your own Git and LazyGit settings:
+
+```sh
+go build -o /tmp/lazygit-gpui-test/lazygit .
+python3 desktop/e2e/workflows.py /tmp/lazygit-gpui-test/lazygit            # all checks
+python3 desktop/e2e/workflows.py /tmp/lazygit-gpui-test/lazygit check_mouse
+```
+
+It covers layout, navigation, line staging, commits with a body, menus and
+filtering, stash prompts and confirmations, branches and tabs, mouse input,
+search, custom commands and the external terminal, background refresh, lazy
+loading of long diffs, the refused suspend, and quitting. The Rust unit tests
+(`cargo test --manifest-path desktop/Cargo.toml`) cover the protocol, key
+translation, the view model and colors.
 
 ---
 

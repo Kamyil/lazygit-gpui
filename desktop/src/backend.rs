@@ -1,41 +1,34 @@
+//! Runs lazygit in desktop mode as a subprocess and exchanges protocol
+//! messages with it on background threads.
+
+use crate::protocol::{Incoming, Outgoing};
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
-use gpui::SharedString;
-use serde::Deserialize;
 use std::{
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    process::{ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc::{self as sync, Receiver, Sender},
     thread,
 };
 
-#[derive(Deserialize)]
-pub struct Pane {
-    pub title: SharedString,
-    pub lines: Vec<SharedString>,
-    pub selected: usize,
-    pub origin: usize,
-}
-
-#[derive(Deserialize)]
-pub struct Snapshot {
-    pub focus: String,
-    pub files: Pane,
-    pub main: Pane,
-    pub secondary: Option<Pane>,
-    pub other: Option<Pane>,
-}
-
 pub enum BackendEvent {
-    Frame(Snapshot),
+    Message(Incoming),
     Closed,
     Error(String),
 }
 
-pub fn launch(
-    bin: PathBuf,
-    repo: &Path,
-) -> Result<(Sender<String>, UnboundedReceiver<BackendEvent>), String> {
+pub struct Backend {
+    input: Sender<Outgoing>,
+}
+
+impl Backend {
+    pub fn send(&self, message: Outgoing) {
+        // If lazygit is gone, the event stream reports it.
+        let _ = self.input.send(message);
+    }
+}
+
+pub fn launch(bin: PathBuf, repo: &Path) -> Result<(Backend, UnboundedReceiver<BackendEvent>), String> {
     let result = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(repo)
@@ -52,54 +45,54 @@ pub fn launch(
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Start LazyGit: {e}"))?;
-    let input = child.stdin.take().expect("piped stdin");
-    let output = child.stdout.take().expect("piped stdout");
-    let (keys, key_rx) = sync::channel();
-    let (event_tx, events) = mpsc::unbounded();
-    thread::spawn(move || {
-        if let Err(err) = exchange(input, output, key_rx, &event_tx) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = event_tx.unbounded_send(BackendEvent::Error(format!("LazyGit bridge: {err}")));
-            return;
-        }
-        match child.wait() {
-            Ok(status) if status.success() => {
-                let _ = event_tx.unbounded_send(BackendEvent::Closed);
-            }
-            result => {
-                let _ = event_tx
-                    .unbounded_send(BackendEvent::Error(format!("LazyGit exited: {result:?}")));
-            }
-        }
-    });
-    Ok((keys, events))
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (input, input_rx) = sync::channel();
+    let (events_tx, events) = mpsc::unbounded();
+
+    thread::spawn(move || write_input(stdin, input_rx));
+    thread::spawn(move || read_output(child, stdout, events_tx));
+    Ok((Backend { input }, events))
 }
 
-fn exchange(
-    mut input: ChildStdin,
-    output: ChildStdout,
-    keys: Receiver<String>,
-    events: &UnboundedSender<BackendEvent>,
-) -> io::Result<()> {
-    let mut reader = BufReader::new(output);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        let snapshot = serde_json::from_str(&line)?;
-        if events
-            .unbounded_send(BackendEvent::Frame(snapshot))
-            .is_err()
-        {
-            return Ok(());
-        }
-        let Ok(key) = keys.recv() else {
-            return Ok(());
-        };
-        serde_json::to_writer(&mut input, &key)?;
-        input.write_all(b"\n")?;
+fn write_input(stdin: ChildStdin, messages: Receiver<Outgoing>) -> io::Result<()> {
+    let mut stdin = BufWriter::new(stdin);
+    for message in messages {
+        serde_json::to_writer(&mut stdin, &message)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
     }
+    Ok(())
+}
+
+fn read_output(mut child: Child, stdout: ChildStdout, events: UnboundedSender<BackendEvent>) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let failure = loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break None,
+            Ok(_) => match serde_json::from_str::<Incoming>(&line) {
+                Ok(message) => {
+                    if events.unbounded_send(BackendEvent::Message(message)).is_err() {
+                        // The window is gone; stop lazygit with it.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return;
+                    }
+                }
+                Err(err) => break Some(format!("Bad message from LazyGit: {err}")),
+            },
+            Err(err) => break Some(format!("Read from LazyGit: {err}")),
+        }
+    };
+    if failure.is_some() {
+        let _ = child.kill();
+    }
+    let event = match (failure, child.wait()) {
+        (Some(error), _) => BackendEvent::Error(error),
+        (None, Ok(status)) if status.success() => BackendEvent::Closed,
+        (None, result) => BackendEvent::Error(format!("LazyGit exited: {result:?}")),
+    };
+    let _ = events.unbounded_send(event);
 }

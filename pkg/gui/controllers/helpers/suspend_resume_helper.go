@@ -2,20 +2,33 @@ package helpers
 
 type SuspendResumeHelper struct {
 	c *HelperCommon
+
+	// True if lazygit runs for the desktop frontend, which shares lazygit's
+	// process group and so would be stopped along with it.
+	inDesktopFrontend bool
 }
 
-func NewSuspendResumeHelper(c *HelperCommon) *SuspendResumeHelper {
+func NewSuspendResumeHelper(c *HelperCommon, inDesktopFrontend bool) *SuspendResumeHelper {
 	return &SuspendResumeHelper{
-		c: c,
+		c:                 c,
+		inDesktopFrontend: inDesktopFrontend,
 	}
 }
 
-func (s *SuspendResumeHelper) CanSuspendApp() bool {
-	return canSuspendApp()
+// CannotSuspendAppReason returns why the app can't be suspended, or "" if it
+// can.
+func (s *SuspendResumeHelper) CannotSuspendAppReason() string {
+	if s.inDesktopFrontend {
+		return s.c.Tr.CannotSuspendDesktopApp
+	}
+	if !canSuspendApp() {
+		return s.c.Tr.CannotSuspendApp
+	}
+	return ""
 }
 
 func (s *SuspendResumeHelper) SuspendApp() error {
-	if !canSuspendApp() {
+	if s.CannotSuspendAppReason() != "" {
 		return nil
 	}
 

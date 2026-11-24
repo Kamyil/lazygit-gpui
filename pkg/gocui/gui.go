@@ -214,6 +214,10 @@ type Gui struct {
 
 	ErrorHandler func(error) error
 
+	// AfterFlush, if set, is called on the UI thread whenever the views have
+	// been drawn, so that a frontend that draws them itself can mirror them.
+	AfterFlush func()
+
 	ShouldHandleMouseEvent func(view *View, key KeyName) bool
 
 	screen         tcell.Screen
@@ -384,6 +388,49 @@ func (g *Gui) ReplayKeyEvent(ev *TcellKeyEventWrapper) {
 func (g *Gui) ReplayMouseEvent(ev *TcellMouseEventWrapper) {
 	ev.task = g.NewTask()
 	g.replayedEvents.MouseEvents <- ev
+}
+
+// ReplayViewMouseEvent is like ReplayMouseEvent, but for a frontend that draws
+// views itself and so knows which part of a view's content was clicked rather
+// than where on the screen that is. The position is in the view's content:
+// column x of buffer line y (as indexed by BufferLines), regardless of how the
+// view is scrolled; if the line is scrolled out of the view, the view is
+// scrolled to it first, as a user would have to. The event then goes to the
+// view's handlers exactly like a mouse event on the screen at that position.
+// doubleClick makes a click count as a double click.
+func (g *Gui) ReplayViewMouseEvent(viewName string, x, y int, key KeyName, mod Modifier, doubleClick bool) {
+	g.Update(func(g *Gui) error {
+		// Clicks that come in while input is blocked are dropped, as in
+		// handleEvent.
+		if g.withholdingInput() && !IsMouseScrollKey(key) {
+			return nil
+		}
+		v, err := g.View(viewName)
+		if err != nil || !v.Visible {
+			return nil
+		}
+		viewLine, ok := v.ViewLineForBufferLine(y)
+		if !ok {
+			// Past the end of the content: as for a click below the last line.
+			viewLine = v.ViewLinesHeight() + y - v.LinesHeight()
+		}
+		if height := v.InnerHeight(); viewLine < v.oy || viewLine >= v.oy+height {
+			v.SetOriginY(max(0, viewLine-height/2))
+		}
+		v.writeMutex.Lock()
+		gutterWidth := v.inclusionGutterWidth()
+		v.writeMutex.Unlock()
+		ev := GocuiEvent{
+			Type:        eventMouse,
+			Key:         NewKey(key, "", mod),
+			MouseX:      v.x0 + 1 + gutterWidth + x - v.ox,
+			MouseY:      v.y0 + 1 + viewLine - v.oy,
+			When:        time.Now(),
+			doubleClick: doubleClick,
+		}
+		g.mouseGestureCanceled = false
+		return g.onMouseOnView(&ev, v, ev.MouseX, ev.MouseY)
+	})
 }
 
 // ReplayFocusEvent is like ReplayKeyEvent, but for focus events.
@@ -1636,7 +1683,14 @@ func (g *Gui) flush() error {
 	}
 
 	Screen.Show()
+	g.afterFlush()
 	return nil
+}
+
+func (g *Gui) afterFlush() {
+	if g.AfterFlush != nil {
+		g.AfterFlush()
+	}
 }
 
 // Redraws only dirty views and skips the layout pass.
@@ -1654,6 +1708,7 @@ func (g *Gui) flushContentOnly(views []*View) {
 	}
 
 	Screen.Show()
+	g.afterFlush()
 }
 
 func viewsToRedrawContentOnly(views []*View) []*View {
@@ -1843,133 +1898,7 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 				break
 			}
 		}
-		if ev.Key.KeyName() == MouseRelease {
-			g.releaseMouseCapture()
-		}
-
-		// newCx and newCy are relative to the view port, i.e. to the visible area of the view
-		newCx := mx - v.x0 - 1
-		newCy := my - v.y0 - 1
-		// newX and newY are relative to the view's content, independent of its scroll position
-		newX := v.contentX(newCx)
-		newY := newCy + v.oy
-		// if view is editable don't go further than the furthest character for that line
-		if v.Editable {
-			if newY < 0 {
-				newY = 0
-				newCy = -v.oy
-			} else if newY >= len(v.buf.lines) {
-				newY = len(v.buf.lines) - 1
-				newCy = newY - v.oy
-			}
-
-			visibleLineWidth := 0
-			for _, c := range v.buf.lines[newY].cells {
-				visibleLineWidth += c.width
-			}
-			if visibleLineWidth < newX {
-				newX = visibleLineWidth
-				newCx = visibleLineWidth - v.ox
-			}
-		}
-
-		if ev.Key.KeyName() == MouseLeft && (ev.Key.Mod()&ModMotion) == 0 && !v.Editable && g.openHyperlink != nil {
-			if link := v.hyperlinkAt(newX, newY); link != "" {
-				return g.openHyperlink(link, v.name)
-			}
-		}
-
-		var mouseOpts ViewMouseBindingOpts
-		if IsMouseKey(ev.Key) {
-			mouseOpts = ViewMouseBindingOpts{
-				X: newX, Y: newY, Key: ev.Key.KeyName(),
-				IsDoubleClick: g.isDoubleClick(newX, newY, ev.Key.KeyName(), v, ev.When),
-			}
-
-			// Dispatch bindings that opt into firing while a popup panel is focused
-			// before the gate below gets a chance to reject the click.
-			matched, err := g.execMouseKeybindings(v, ev, mouseOpts, true)
-			if err != nil {
-				return err
-			}
-			if matched {
-				g.recordClickInfo(newX, newY, ev.Key.KeyName(), v, ev.When)
-				return nil
-			}
-		}
-
-		if g.ShouldHandleMouseEvent != nil {
-			if !g.ShouldHandleMouseEvent(v, ev.Key.KeyName()) {
-				// Give clients a chance to reject clicks, for example clicks in inactive views
-				// when a modal panel is open.
-				break
-			}
-		}
-		// Bindings match modifiers exactly, so a gesture with a keyboard modifier held
-		// is a gesture of its own, and the bindings that act on a plain click pass it
-		// by. It therefore has to leave the view as it found it: the cursor stays where
-		// the selection is (a list view draws its selection at the cursor), and no
-		// mouse capture begins for a drag that no binding will extend. ModMotion comes
-		// from the mouse rather than the keyboard, and every drag carries it, so it is
-		// masked out here.
-		gestureIsModified := ev.Key.Mod()&^ModMotion != ModNone
-
-		if ev.Key.KeyName() == MouseLeft && ev.Key.Mod() == ModNone {
-			g.captureMouse(v)
-		}
-
-		if !IsMouseScrollKey(ev.Key.KeyName()) && ev.Key.KeyName() != MouseRelease &&
-			!gestureIsModified {
-			cursorX, cursorY := newCx, newCy
-			// A captured drag can report positions outside the view; keep the
-			// view cursor inside its bounds in that case. Handlers still get
-			// the unclamped position through the binding opts.
-			if g.mouseCapture != nil {
-				cursorX = max(0, min(cursorX, v.InnerWidth()-1))
-				cursorY = max(0, min(cursorY, v.InnerHeight()-1))
-			}
-			v.SetCursor(cursorX, cursorY)
-			if v.Editable {
-				v.TextArea.SetCursor2D(newX, newY)
-
-				// SetCursor2D might have adjusted the text area's cursor to the
-				// left to move left from a soft line break, so we need to
-				// update the view's cursor to match the text area's cursor.
-				cX, _ := v.TextArea.GetCursorXY()
-				v.SetCursorX(cX)
-			}
-		}
-
-		// Only an actual click may activate tabs; a captured drag that
-		// crosses the tab row must not switch tabs.
-		if ev.Key.KeyName() == MouseLeft && ev.Key.Mod()&ModMotion == 0 && v.Frame && my == v.y0 {
-			if len(v.Tabs) > 0 {
-				tabIndex := v.GetClickedTabIndex(mx - v.x0)
-
-				if tabIndex >= 0 {
-					for _, binding := range g.tabClickBindings {
-						if binding.viewName == v.Name() {
-							return binding.handler(tabIndex)
-						}
-					}
-				}
-			}
-		}
-
-		if IsMouseKey(ev.Key) {
-			g.recordClickInfo(newX, newY, ev.Key.KeyName(), v, ev.When)
-			matched, err := g.execMouseKeybindings(v, ev, mouseOpts, false)
-			if err != nil {
-				return err
-			}
-			if matched {
-				return nil
-			}
-		}
-
-		if err := g.execKeybindings(v, ev); err != nil {
-			return err
-		}
+		return g.onMouseOnView(ev, v, mx, my)
 
 	case eventMouseMove:
 		mx, my := ev.MouseX, ev.MouseY
@@ -1985,6 +1914,140 @@ func (g *Gui) onKey(ev *GocuiEvent) error {
 		v.onMouseMove(mx, my)
 
 	default:
+	}
+
+	return nil
+}
+
+// onMouseOnView handles a mouse event at screen position (mx, my) that goes to
+// view v.
+func (g *Gui) onMouseOnView(ev *GocuiEvent, v *View, mx, my int) error {
+	if ev.Key.KeyName() == MouseRelease {
+		g.releaseMouseCapture()
+	}
+
+	// newCx and newCy are relative to the view port, i.e. to the visible area of the view
+	newCx := mx - v.x0 - 1
+	newCy := my - v.y0 - 1
+	// newX and newY are relative to the view's content, independent of its scroll position
+	newX := v.contentX(newCx)
+	newY := newCy + v.oy
+	// if view is editable don't go further than the furthest character for that line
+	if v.Editable {
+		if newY < 0 {
+			newY = 0
+			newCy = -v.oy
+		} else if newY >= len(v.buf.lines) {
+			newY = len(v.buf.lines) - 1
+			newCy = newY - v.oy
+		}
+
+		visibleLineWidth := 0
+		for _, c := range v.buf.lines[newY].cells {
+			visibleLineWidth += c.width
+		}
+		if visibleLineWidth < newX {
+			newX = visibleLineWidth
+			newCx = visibleLineWidth - v.ox
+		}
+	}
+
+	if ev.Key.KeyName() == MouseLeft && (ev.Key.Mod()&ModMotion) == 0 && !v.Editable && g.openHyperlink != nil {
+		if link := v.hyperlinkAt(newX, newY); link != "" {
+			return g.openHyperlink(link, v.name)
+		}
+	}
+
+	var mouseOpts ViewMouseBindingOpts
+	if IsMouseKey(ev.Key) {
+		mouseOpts = ViewMouseBindingOpts{
+			X: newX, Y: newY, Key: ev.Key.KeyName(),
+			IsDoubleClick: ev.doubleClick || g.isDoubleClick(newX, newY, ev.Key.KeyName(), v, ev.When),
+		}
+
+		// Dispatch bindings that opt into firing while a popup panel is focused
+		// before the gate below gets a chance to reject the click.
+		matched, err := g.execMouseKeybindings(v, ev, mouseOpts, true)
+		if err != nil {
+			return err
+		}
+		if matched {
+			g.recordClickInfo(newX, newY, ev.Key.KeyName(), v, ev.When)
+			return nil
+		}
+	}
+
+	if g.ShouldHandleMouseEvent != nil {
+		if !g.ShouldHandleMouseEvent(v, ev.Key.KeyName()) {
+			// Give clients a chance to reject clicks, for example clicks in inactive views
+			// when a modal panel is open.
+			return nil
+		}
+	}
+	// Bindings match modifiers exactly, so a gesture with a keyboard modifier held
+	// is a gesture of its own, and the bindings that act on a plain click pass it
+	// by. It therefore has to leave the view as it found it: the cursor stays where
+	// the selection is (a list view draws its selection at the cursor), and no
+	// mouse capture begins for a drag that no binding will extend. ModMotion comes
+	// from the mouse rather than the keyboard, and every drag carries it, so it is
+	// masked out here.
+	gestureIsModified := ev.Key.Mod()&^ModMotion != ModNone
+
+	if ev.Key.KeyName() == MouseLeft && ev.Key.Mod() == ModNone {
+		g.captureMouse(v)
+	}
+
+	if !IsMouseScrollKey(ev.Key.KeyName()) && ev.Key.KeyName() != MouseRelease &&
+		!gestureIsModified {
+		cursorX, cursorY := newCx, newCy
+		// A captured drag can report positions outside the view; keep the
+		// view cursor inside its bounds in that case. Handlers still get
+		// the unclamped position through the binding opts.
+		if g.mouseCapture != nil {
+			cursorX = max(0, min(cursorX, v.InnerWidth()-1))
+			cursorY = max(0, min(cursorY, v.InnerHeight()-1))
+		}
+		v.SetCursor(cursorX, cursorY)
+		if v.Editable {
+			v.TextArea.SetCursor2D(newX, newY)
+
+			// SetCursor2D might have adjusted the text area's cursor to the
+			// left to move left from a soft line break, so we need to
+			// update the view's cursor to match the text area's cursor.
+			cX, _ := v.TextArea.GetCursorXY()
+			v.SetCursorX(cX)
+		}
+	}
+
+	// Only an actual click may activate tabs; a captured drag that
+	// crosses the tab row must not switch tabs.
+	if ev.Key.KeyName() == MouseLeft && ev.Key.Mod()&ModMotion == 0 && v.Frame && my == v.y0 {
+		if len(v.Tabs) > 0 {
+			tabIndex := v.GetClickedTabIndex(mx - v.x0)
+
+			if tabIndex >= 0 {
+				for _, binding := range g.tabClickBindings {
+					if binding.viewName == v.Name() {
+						return binding.handler(tabIndex)
+					}
+				}
+			}
+		}
+	}
+
+	if IsMouseKey(ev.Key) {
+		g.recordClickInfo(newX, newY, ev.Key.KeyName(), v, ev.When)
+		matched, err := g.execMouseKeybindings(v, ev, mouseOpts, false)
+		if err != nil {
+			return err
+		}
+		if matched {
+			return nil
+		}
+	}
+
+	if err := g.execKeybindings(v, ev); err != nil {
+		return err
 	}
 
 	return nil

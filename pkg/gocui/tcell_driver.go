@@ -185,6 +185,10 @@ type GocuiEvent struct {
 	Start   bool
 	N       int
 
+	// doubleClick marks a mouse event as a double click regardless of the
+	// clicks before it (see Gui.ReplayViewMouseEvent).
+	doubleClick bool
+
 	// task tracks the processing of this event for idle detection. Events
 	// replayed by integration tests carry a task from the moment they are
 	// submitted (see Gui.ReplayKeyEvent); for organic events it is nil, and

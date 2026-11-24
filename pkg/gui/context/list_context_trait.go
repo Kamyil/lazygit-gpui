@@ -24,6 +24,9 @@ type ListContextTrait struct {
 	// If renderOnlyVisibleLines is true, needRerenderVisibleLines indicates whether we need to
 	// rerender the visible lines e.g. because the scroll position changed
 	needRerenderVisibleLines bool
+	// If true, the list renders all of its lines whenever it renders any, see
+	// RenderAllLines.
+	renderAllLines bool
 
 	// true if we're inside the OnSearchSelect call; in that case we don't want to update the search
 	// result index.
@@ -88,7 +91,20 @@ func (self *ListContextTrait) FocusLine(scrollIntoView bool) {
 	self.setFooter()
 }
 
+// RenderAllLines makes the list render all of its lines, also where it would
+// otherwise render only those in its viewport. This is for a frontend that
+// draws the view's content itself and scrolls it independently of the view's
+// origin, so that every line it can show has to be in the view's content.
+func (self *ListContextTrait) RenderAllLines() {
+	self.renderAllLines = true
+	self.renderOnlyVisibleLines = false
+}
+
 func (self *ListContextTrait) refreshViewport() {
+	if self.renderAllLines {
+		self.GetViewTrait().SetContent(self.renderLines(-1, -1))
+		return
+	}
 	startIdx, length := self.GetViewTrait().ViewPortYBounds()
 	content := self.renderLines(startIdx, startIdx+length)
 	self.GetViewTrait().SetViewPortContent(content)

@@ -17,6 +17,7 @@ coverage.txt
 lazygit
 lazygit.exe
 /desktop/target/
+/desktop/e2e/__pycache__/
 
 test/git_server/data
 
