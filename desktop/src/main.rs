@@ -229,6 +229,7 @@ impl Panel {
                                     Some(
                                         div()
                                             .h(px(22.))
+                                            .w_full()
                                             .px_2()
                                             .flex()
                                             .items_center()
@@ -302,7 +303,8 @@ impl Render for Workbench {
                     .flex()
                     .child(
                         div()
-                            .w(px(310.))
+                            .w(gpui::relative(0.30))
+                            .max_w(px(310.))
                             .flex_none()
                             .flex()
                             .flex_col()
@@ -396,6 +398,7 @@ fn main() -> Result<(), String> {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(580.), px(360.))),
                 ..Default::default()
             },
             move |window, cx| {
